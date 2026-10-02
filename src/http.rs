@@ -308,6 +308,101 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn unknown_command_does_not_enqueue() {
+        let state = make_state(cfg_with_token("write-secret"));
+        state.shared.set_connected(true);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        *state.shared.command_tx.lock() = Some(tx);
+        let mut headers = HeaderMap::new();
+        headers.insert("Authorization", "Bearer write-secret".parse().unwrap());
+        assert!(matches!(
+            command_post(
+                State(state),
+                Path("reboot".into()),
+                headers,
+                Json(serde_json::json!({})),
+            )
+            .await,
+            Err(AppError::NotFound(_))
+        ));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn toggle_route_enqueues_one_scoped_payload() {
+        use axum::{body::Body, http::Request};
+        use tower::ServiceExt;
+
+        let state = make_state(cfg_with_token("write-secret"));
+        state.shared.set_connected(true);
+        state
+            .shared
+            .update_inverter(serde_json::json!({"booleans":{"only_charging":false}}));
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        *state.shared.command_tx.lock() = Some(tx);
+        let app = router(state);
+        let post = |token: Option<&str>, path: &str, body: &str| {
+            let mut request = Request::builder()
+                .method("POST")
+                .uri(path)
+                .header("Content-Type", "application/json");
+            if let Some(token) = token {
+                request = request.header("Authorization", format!("Bearer {token}"));
+            }
+            request.body(Body::from(body.to_string())).unwrap()
+        };
+        let rejected = [
+            (
+                Some("read-secret"),
+                "/v1/commands/toggle",
+                r#"{"entity":"only_charging","state":"on"}"#,
+                StatusCode::UNAUTHORIZED,
+            ),
+            (
+                Some("write-secret"),
+                "/v1/commands/toggle",
+                "{",
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                Some("write-secret"),
+                "/v1/commands/toggle",
+                r#"{"entity":"switch.no_feed","state":"on"}"#,
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                Some("write-secret"),
+                "/v1/commands/reboot",
+                "{}",
+                StatusCode::NOT_FOUND,
+            ),
+        ];
+        for (token, path, body, status) in rejected {
+            let response = app.clone().oneshot(post(token, path, body)).await.unwrap();
+            assert_eq!(response.status(), status, "{path} {body}");
+            assert!(rx.try_recv().is_err(), "{path} {body}");
+        }
+        let response = app
+            .oneshot(post(
+                Some("write-secret"),
+                "/v1/commands/toggle",
+                r#"{"entity":"only_charging","state":"on"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let command = rx.try_recv().unwrap();
+        assert!(rx.try_recv().is_err());
+        assert_eq!(command.topic, "inverter/cmd/toggle");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&command.payload).unwrap(),
+            serde_json::json!({"entity":"only_charging","state":"on"})
+        );
+        assert!(command.is_guarded());
+        assert!(!command.is_water_command());
+    }
+
+    #[tokio::test]
     async fn water_command_route_requires_write_auth_and_exact_native_payload() {
         use axum::{body::Body, http::Request};
         use tower::ServiceExt;
